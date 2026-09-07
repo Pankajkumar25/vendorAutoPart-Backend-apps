@@ -1,0 +1,28 @@
+# dependencies
+node_modules/
+
+# build
+dist/
+
+# environment
+.env
+.env.local
+.env.*.local
+
+# logs
+*.log
+npm-debug.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# test
+coverage/
+
+# typescript
+*.tsbuildinfo
