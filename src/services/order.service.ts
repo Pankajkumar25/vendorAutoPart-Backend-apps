@@ -83,7 +83,7 @@ export interface CreateOrderResult {
  * two customers racing for the last unit cannot both succeed. Any partial
  * success is rolled back before the error propagates.
  */
-async function reserveStock(
+export async function reserveStock(
   items: { productId: string; quantity: number; name: string }[],
   session?: mongoose.ClientSession,
 ): Promise<void> {
@@ -205,6 +205,40 @@ export async function createOrder(input: CreateOrderInput): Promise<CreateOrderR
     isDeleted: false,
   });
   if (!address) throw new ApiError(404, 'Delivery address not found', ERROR_CODES.ADDRESS_REQUIRED);
+
+  // Guard: if the user already has a pending unpaid order, reuse it instead of
+  // creating a duplicate (which would cause Razorpay "payment id already in use"
+  // errors when the user retries).
+  const existingPending = await Order.findOne({
+    userId: input.userId,
+    status: ORDER_STATUS.PENDING,
+    paymentStatus: PAYMENT_STATUS.PENDING,
+  }).sort({ createdAt: -1 });
+
+  if (existingPending) {
+    const existingPayment = await Payment.findOne({
+      orderId: existingPending._id,
+      status: TXN_STATUS.CREATED,
+    }).sort({ createdAt: -1 });
+
+    if (existingPayment) {
+      const g = gateway();
+      return {
+        order: existingPending,
+        pricing: null as any,
+        payment: {
+          required: true,
+          purpose: existingPayment.purpose,
+          amount: existingPayment.expectedAmount,
+          paymentId: String(existingPayment._id),
+          providerOrderId: existingPayment.providerOrderId,
+          provider: g.name,
+          publicKey: g.publicKey,
+          currency: existingPayment.currency,
+        },
+      };
+    }
+  }
 
   // Item source: explicit list, else the customer's active cart.
   let items = input.items;
@@ -492,7 +526,21 @@ export async function verifyPaymentAndConfirm(params: {
   payment.cardLast4 = fetched.cardLast4 ?? null;
   payment.verifiedAt = new Date();
   payment.gatewayResponse = redactGatewayPayload(fetched as unknown as Record<string, unknown>);
-  await payment.save();
+  try {
+    await payment.save();
+  } catch (err: any) {
+    // Duplicate providerPaymentId means this payment was already recorded (e.g.
+    // user retried and Razorpay reused the payment id).  Look up the existing
+    // record so we can return a consistent result instead of crashing.
+    if (err?.code === 11000) {
+      const existing = await Payment.findOne({ providerPaymentId: fetched.providerPaymentId }).lean();
+      if (existing) {
+        const existingOrder = await Order.findById(existing.orderId);
+        if (existingOrder) return { order: existingOrder, alreadyProcessed: true };
+      }
+    }
+    throw err;
+  }
 
   const paidAmount = money(payment.capturedAmount ?? payment.expectedAmount);
   const isAdvance = payment.purpose === PAYMENT_PURPOSE.COD_ADVANCE;

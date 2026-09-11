@@ -35,7 +35,9 @@ const app = express();
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
 
-app.use(helmet());
+app.use(helmet({
+  contentSecurityPolicy: false,
+}));
 app.use(cors({ origin: corsOrigins, credentials: true }));
 app.use(compression());
 
@@ -60,6 +62,79 @@ app.use(hpp());
 // Baseline abuse guard; the stricter per-route limiters (auth, otp, payment,
 // search, upload, order) stack on top of this inside their routers.
 app.use(env.API_PREFIX, generalLimiter, apiRouter);
+
+// --- Razorpay web checkout page (for Expo Go) ---
+app.get('/pay', (req, res) => {
+  const key = req.query.key as string;
+  const orderId = req.query.order_id as string;
+  const amount = req.query.amount as string;
+  const currency = (req.query.currency as string) || 'INR';
+  const name = (req.query.name as string) || 'AutoParts Store';
+  const description = (req.query.description as string) || 'Order Payment';
+  const prefillContact = (req.query.contact as string) || '';
+  const sessionId = req.query.session_id as string;
+  const callbackUrl = (req.query.callback_url as string) || `${req.protocol}://${req.get('host')}/pay/callback`;
+
+  res.send(`<!DOCTYPE html>
+<html><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Payment</title>
+  <style>body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#f5f5f5}
+  .box{text-align:center;padding:2rem;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.1)}
+  .spinner{width:36px;height:36px;border:3px solid #ddd;border-top-color:#4F46E5;border-radius:50%;animation:spin .6s linear infinite;margin:0 auto 1rem}
+  @keyframes spin{to{transform:rotate(360deg)}}</style>
+</head><body>
+  <div class="box"><div class="spinner"></div><p>Opening payment...</p></div>
+  <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+  <script>
+    var rzp = new Razorpay({
+      key: '${key}',
+      amount: ${amount},
+      currency: '${currency}',
+      name: '${name}',
+      description: '${description}',
+      order_id: '${orderId}',
+      handler: function(response) {
+        window.location.href = '${callbackUrl}?session_id=${sessionId}&provider_order_id=' + response.razorpay_order_id + '&provider_payment_id=' + response.razorpay_payment_id + '&signature=' + response.razorpay_signature;
+      },
+      prefill: { contact: '${prefillContact}' },
+      theme: { color: '#4F46E5' },
+      modal: {
+        ondismiss: function() {
+          window.location.href = '${callbackUrl}?session_id=${sessionId}&cancelled=true';
+        }
+      }
+    });
+    rzp.open();
+  </script>
+</body></html>`);
+});
+
+app.get('/pay/callback', (req, res) => {
+  const sessionId = req.query.session_id as string;
+  const cancelled = req.query.cancelled === 'true';
+  const providerOrderId = req.query.provider_order_id as string || '';
+  const providerPaymentId = req.query.provider_payment_id as string || '';
+  const signature = req.query.signature as string || '';
+
+  if (cancelled) {
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Cancelled</title></head><body style="font-family:sans-serif;text-align:center;padding:3rem">
+    <h2>Payment cancelled</h2><p>You can try again from the app.</p>
+    <script>setTimeout(function(){window.close()},1500)</script>
+    </body></html>`);
+    return;
+  }
+
+  // Redirect back to app via deep link with payment details
+  const deepLink = `autoparts://checkout-confirm?session_id=${sessionId}&provider_order_id=${providerOrderId}&provider_payment_id=${providerPaymentId}&signature=${signature}`;
+
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Payment Done</title></head><body style="font-family:sans-serif;text-align:center;padding:3rem">
+  <h2 style="color:green">Payment successful!</h2><p>Returning to app...</p>
+  <script>window.location.href = '${deepLink}'; setTimeout(function(){window.close()},3000)</script>
+  </body></html>`);
+});
 
 app.use(notFoundHandler);
 app.use(errorHandler);

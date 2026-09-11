@@ -78,6 +78,32 @@ export async function broadcast(
   return users.length;
 }
 
+/** Notify every admin user. Used for new orders, low-stock alerts, etc. */
+export async function notifyAdmins(
+  input: Omit<CreateNotificationInput, 'userId'>,
+): Promise<number> {
+  const admins = await User.find({ role: 'ADMIN', status: 'ACTIVE' })
+    .select('_id')
+    .lean();
+
+  if (!admins.length) return 0;
+
+  await Notification.insertMany(
+    admins.map((a) => ({
+      userId: a._id,
+      type: input.type ?? NOTIFICATION_TYPE.GENERAL,
+      title: input.title,
+      body: input.body,
+      route: input.route,
+      image: input.image,
+      data: input.data,
+    })),
+  );
+
+  logger.info(`[notify] admin notification "${input.title}" to ${admins.length} admins`);
+  return admins.length;
+}
+
 /**
  * Push transport seam. Currently logs only.
  *
@@ -166,6 +192,7 @@ export async function notifyOrderPlaced(params: {
   orderNumber: string;
   total: number;
 }): Promise<void> {
+  // Notify the customer
   await createNotification({
     userId: params.userId,
     type: NOTIFICATION_TYPE.ORDER_PLACED,
@@ -173,6 +200,15 @@ export async function notifyOrderPlaced(params: {
     body: `We have received order ${params.orderNumber} for ${formatINR(params.total)}.`,
     route: `/order/${params.orderId}`,
     data: { orderId: String(params.orderId), orderNumber: params.orderNumber },
+  });
+
+  // Notify all admin users about the new order
+  await notifyAdmins({
+    type: NOTIFICATION_TYPE.ORDER_PLACED,
+    title: 'New order received',
+    body: `Order ${params.orderNumber} for ${formatINR(params.total)} has been placed.`,
+    route: `/admin/order/${params.orderId}`,
+    data: { orderId: String(params.orderId), orderNumber: params.orderNumber, total: params.total },
   });
 }
 

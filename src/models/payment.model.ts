@@ -79,9 +79,6 @@ const paymentSchema = new Schema<IPayment>(
 );
 
 paymentSchema.index({ providerOrderId: 1 }, { unique: true });
-// Sparse+unique: a gateway payment id can only ever be recorded once, which
-// makes the verify endpoint idempotent against replayed success callbacks.
-paymentSchema.index({ providerPaymentId: 1 }, { unique: true, sparse: true });
 paymentSchema.index({ orderId: 1, purpose: 1, status: 1 });
 paymentSchema.index({ createdAt: -1 });
 

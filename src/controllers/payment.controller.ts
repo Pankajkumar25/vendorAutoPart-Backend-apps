@@ -9,6 +9,7 @@ import { ApiError } from '../utils/apiError';
 import { logger } from '../config/logger';
 import { env } from '../config/env';
 import { PAYMENT_PURPOSE, TXN_STATUS } from '../config/constants';
+import { money } from '../utils/money';
 
 /**
  * Payments (spec section 20, RULE 16).
@@ -150,8 +151,34 @@ export async function simulatePayment(req: Request, res: Response): Promise<void
   const adapter = mockAdapter();
 
   const providerOrderId = String(req.body.providerOrderId ?? '');
-  const payment = await Payment.findOne({ providerOrderId });
-  if (!payment) throw ApiError.notFound('Payment record not found');
+
+  // Try old flow: find existing Payment record
+  let payment = await Payment.findOne({ providerOrderId });
+
+  // New checkout flow: payment record may not exist yet — find the session
+  if (!payment) {
+    const { CheckoutSession } = await import('../models/checkoutSession.model');
+    const session = await CheckoutSession.findOne({
+      providerOrderId,
+      userId: auth.userId,
+      status: 'PENDING',
+    });
+    if (!session) throw ApiError.notFound('Payment / session not found');
+
+    const receipt = `sim_${providerOrderId.slice(-8)}`;
+    payment = await Payment.create({
+      orderId: session._id, // temporary — confirmCheckout links to real order
+      userId: auth.userId,
+      purpose: PAYMENT_PURPOSE.FULL,
+      provider: session.provider ?? 'mock',
+      providerOrderId,
+      receipt,
+      expectedAmount: money(session.amountDueNow),
+      currency: session.currency ?? 'INR',
+      status: TXN_STATUS.CREATED,
+    });
+  }
+
   if (String(payment.userId) !== String(auth.userId)) {
     throw ApiError.forbidden('This payment does not belong to your account');
   }
@@ -159,25 +186,53 @@ export async function simulatePayment(req: Request, res: Response): Promise<void
   const providerPaymentId = adapter.makePaymentId(providerOrderId);
   const signature = adapter.signPayload(providerOrderId, providerPaymentId);
 
-  const { order, alreadyProcessed } = await orderService.verifyPaymentAndConfirm({
-    userId: auth.userId,
-    providerOrderId,
-    providerPaymentId,
-    signature,
-  });
+  // Check if this is the old flow (Payment linked to an existing Order) or new flow (checkout session)
+  const existingOrder = await Order.findById(payment.orderId);
 
-  ok(
-    res,
-    {
-      simulated: true,
-      orderId: String(order._id),
-      orderNumber: order.orderNumber,
-      status: order.status,
-      paymentStatus: order.paymentStatus,
-      alreadyProcessed,
-    },
-    'Mock payment completed',
-  );
+  if (existingOrder) {
+    // Old flow: verify + confirm
+    const { order, alreadyProcessed } = await orderService.verifyPaymentAndConfirm({
+      userId: auth.userId,
+      providerOrderId,
+      providerPaymentId,
+      signature,
+    });
+
+    ok(
+      res,
+      {
+        simulated: true,
+        orderId: String(order._id),
+        orderNumber: order.orderNumber,
+        status: order.status,
+        paymentStatus: order.paymentStatus,
+        alreadyProcessed,
+      },
+      'Mock payment completed',
+    );
+  } else {
+    // New checkout flow: just update payment, confirmCheckout will handle the rest
+    payment.providerPaymentId = providerPaymentId;
+    payment.status = TXN_STATUS.SUCCESS;
+    payment.verifiedAt = new Date();
+    await payment.save();
+
+    ok(
+      res,
+      {
+        simulated: true,
+        providerOrderId,
+        providerPaymentId,
+        signature,
+        orderId: null,
+        orderNumber: null,
+        status: null,
+        paymentStatus: null,
+        alreadyProcessed: false,
+      },
+      'Mock payment simulated',
+    );
+  }
 }
 
 /**
